@@ -70,33 +70,39 @@ THRESHOLD = {'forecast_1': 25, 'forecast_2': 349408, 'forecast_3': 0.005, 'forec
 }
 EVENT_WINDOW = {'forecast_1': '2026-2030', 'forecast_2': '2026', 'forecast_3':'2030', 'forecast_4': '2028-2032', 'forecast_5': '2026-2030','forecast_6': '2027','forecast_7': '2026-2030','forecast_8': '2026-2030', 'forecast_9':'2026-2030', 'forecast_10':'2026', 'forecast_11':'2032', 'forecast_12':'2026'}
 
+
 def make_series(name):
-    v = globals()[name]
-    s = series_info[name]['start']
-    return pd.Series(v, index=range(s, s + len(v)), name=name)
+    vals = globals()[name]
+    start = series_info[name]['start']
+    return pd.Series(vals, index=range(start, start + len(vals)), name=name)
+
 
 def fit_ets(y):
-    m = ExponentialSmoothing(y, trend="add", damped_trend=True, seasonal=None)
-    return m.fit(optimized=True)
+    return ExponentialSmoothing(y, trend="add", damped_trend=True, seasonal=None).fit(optimized=True)
+
 
 def get_driver_z_series(drv, lag, idx, targets):
     hist = make_series(drv)
+    hist_end = hist.index.max()
+    years = np.arange(hist_end + 1, idx.max() + 1)
     sd_drv = hist.std(ddof=0) or 1
     z_target = targets.get(drv, 0) / sd_drv
-    years = np.arange(idx.min(), idx.max() + 1)
     ramp = pd.Series(np.linspace(0, z_target, len(years)), index=years)
     if lag:
         ramp = ramp.shift(lag)
-    return ramp.reindex(idx).fillna(0.0)
+    z = pd.Series(0.0, index=idx)
+    z.update(ramp.reindex(idx).fillna(0.0))
+    return z
+
 
 def run_pipeline(key, targets):
     y_hist = make_series(key)
+    hist_end = y_hist.index.max()
     ets = fit_ets(y_hist)
-    fut_years = list(range(y_hist.index[-1] + 1, 2036))
-    y_fore = ets.forecast(len(fut_years))
-    y_base = pd.concat([y_hist, pd.Series(y_fore, index=fut_years, name=key)])
+    fut_years = list(range(hist_end + 1, 2036))
+    y_base = pd.concat([y_hist, ets.forecast(len(fut_years)).set_axis(fut_years)])
 
-    mse = np.mean(ets.resid ** 2)
+    mse = (ets.resid ** 2).mean()
     steps = np.arange(1, len(fut_years) + 1)
     band = pd.concat([
         pd.Series(0, y_hist.index),
@@ -117,36 +123,35 @@ def run_pipeline(key, targets):
     inc_df = pd.DataFrame(increments)
     inc_df['driver_increment'] = inc_df.sum(axis=1)
 
-    effects = pd.DataFrame(index=y_base.index)
-    effects['adjusted_level'] = y_base + inc_df['driver_increment']
-    effects = effects.loc[fut_years]
+    effects = pd.DataFrame(index=fut_years)
+    effects['adjusted_level'] = y_base.loc[fut_years] + inc_df.loc[fut_years, 'driver_increment']
 
     base_z = (y_base - mu[key]) / sd[key]
-    adj_z = base_z + sum(
-        get_driver_z_series(d, int(l), y_base.index, targets) * ols.params[d]
-        for d,l in [t.split('_L') for t in terms]
-    )
-    band_z = (band / 1.96) / sd[key]
-    band_z.loc[y_hist.index] = 0
+    adj_z = base_z.copy()
+    for drv, lag in [t.split('_L') for t in terms]:
+        dz = get_driver_z_series(drv, int(lag), y_base.index, targets)
+        adj_z += ols.params[drv] * dz
 
-    N = 5000
-    tot = len(adj_z)
+    band_z = band / 1.96 / sd[key]
+    band_z.loc[y_hist.index] = 0
+    N, tot = 5000, len(adj_z)
     noise_ets = np.random.normal(0, band_z.values[None, :], (N, tot))
     boot = np.random.choice(ols.resid, size=(N, tot - len(y_hist)), replace=True)
     noise_res = np.zeros((N, tot))
     noise_res[:, len(y_hist):] = boot
-    sims_full = (adj_z.values + noise_ets + noise_res) * sd[key] + mu[key]
-    sims = sims_full[:, len(y_hist):]
+
+    sims = (adj_z.values + noise_ets + noise_res) * sd[key] + mu[key]
 
     win = EVENT_WINDOW[key]
     thr = THRESHOLD[key]
     if '-' in win:
         start, end = map(int, win.split('-'))
-        mask = [(y >= start and y <= end) for y in fut_years]
+        mask = [i for i, y in enumerate(fut_years) if start <= y <= end]
         metric = sims[:, mask].mean(axis=1)
     else:
         idx = fut_years.index(int(win))
         metric = sims[:, idx]
     prob = (metric > thr).mean()
 
-    return prob, sims, effects
+    sims_fc = sims[:, :]
+    return prob, sims_fc, effects
