@@ -81,8 +81,12 @@ def fit_ets(y):
     return model.fit(optimized=True)
 
 def get_driver_z_series(drv, lag, idx, targets):
+    hist = make_series(drv)
+    sd_drv = hist.std(ddof=0)
+    # convert the raw‐unit target into a z-shift
+    z_target = targets.get(drv, 0) / (sd_drv if sd_drv != 0 else 1)
     years = np.arange(idx.min(), idx.max() + 1)
-    ramp = pd.Series(np.linspace(0, targets.get(drv, 0), len(years)), index=years)
+    ramp = pd.Series(np.linspace(0, z_target, len(years)), index=years)
     if lag:
         ramp = ramp.shift(lag)
     return ramp.reindex(idx).fillna(0.0)
