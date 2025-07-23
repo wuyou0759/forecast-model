@@ -70,21 +70,19 @@ THRESHOLD = {'forecast_1': 25, 'forecast_2': 349408, 'forecast_3': 0.005, 'forec
 }
 EVENT_WINDOW = {'forecast_1': '2026-2030', 'forecast_2': '2026', 'forecast_3':'2030', 'forecast_4': '2028-2032', 'forecast_5': '2026-2030','forecast_6': '2027','forecast_7': '2026-2030','forecast_8': '2026-2030', 'forecast_9':'2026-2030', 'forecast_10':'2026', 'forecast_11':'2032', 'forecast_12':'2026'}
 
-
 def make_series(name):
-    vals = globals()[name]
-    start = series_info[name]['start']
-    return pd.Series(vals, index=range(start, start + len(vals)), name=name)
+    v = globals()[name]
+    s = series_info[name]['start']
+    return pd.Series(v, index=range(s, s + len(v)), name=name)
 
 def fit_ets(y):
-    model = ExponentialSmoothing(y, trend='add', damped_trend=True, seasonal=None)
-    return model.fit(optimized=True)
+    m = ExponentialSmoothing(y, trend="add", damped_trend=True, seasonal=None)
+    return m.fit(optimized=True)
 
 def get_driver_z_series(drv, lag, idx, targets):
     hist = make_series(drv)
-    sd_drv = hist.std(ddof=0)
-    # convert the raw‐unit target into a z-shift
-    z_target = targets.get(drv, 0) / (sd_drv if sd_drv != 0 else 1)
+    sd_drv = hist.std(ddof=0) or 1
+    z_target = targets.get(drv, 0) / sd_drv
     years = np.arange(idx.min(), idx.max() + 1)
     ramp = pd.Series(np.linspace(0, z_target, len(years)), index=years)
     if lag:
@@ -95,56 +93,60 @@ def run_pipeline(key, targets):
     y_hist = make_series(key)
     ets = fit_ets(y_hist)
     fut_years = list(range(y_hist.index[-1] + 1, 2036))
-    y_base = pd.concat([y_hist, ets.forecast(len(fut_years)).set_axis(fut_years)])
+    y_fore = ets.forecast(len(fut_years))
+    y_base = pd.concat([y_hist, pd.Series(y_fore, index=fut_years, name=key)])
 
-    mse = np.mean(ets.resid**2)
+    mse = np.mean(ets.resid ** 2)
     steps = np.arange(1, len(fut_years) + 1)
-    band = pd.concat([pd.Series(0, y_hist.index), pd.Series(1.96 * np.sqrt(mse * steps), fut_years)])
+    band = pd.concat([
+        pd.Series(0, y_hist.index),
+        pd.Series(1.96 * np.sqrt(mse * steps), fut_years)
+    ])
 
-    terms = DRIVER_MAP.get(key)
-    if terms is None:
-        raise ValueError(f"No drivers specified for {key}")
-
+    terms = DRIVER_MAP[key]
     drivers = [t.split('_L')[0] for t in terms]
     df = pd.concat([y_hist] + [make_series(d) for d in drivers], axis=1, join='inner')
     mu, sd = df.mean(), df.std(ddof=0)
     z = (df - mu) / sd
     ols = sm.OLS(z[key], z.drop(columns=[key])).fit()
 
-    total_adj = pd.Series(0.0, index=y_base.index)
-    for t in terms:
-        drv, lag = t.split('_L')
-        adj = get_driver_z_series(drv, int(lag), y_base.index, targets)
-        total_adj += ols.params[drv] * adj
+    increments = {}
+    for drv, lag in [t.split('_L') for t in terms]:
+        dz = get_driver_z_series(drv, int(lag), y_base.index, targets)
+        increments[drv] = ols.params[drv] * dz * sd[key]
+    inc_df = pd.DataFrame(increments)
+    inc_df['driver_increment'] = inc_df.sum(axis=1)
 
-    effects = pd.DataFrame({drv: ols.params[drv] * get_driver_z_series(drv, int(lag), y_base.index, targets) * sd[key]
-                             for drv, lag in [t.split('_L') for t in terms]})
-    effects['baseline_level'] = y_base
-    effects['total_driver_effect'] = effects.sum(axis=1)
-    effects['adjusted_level'] = effects['baseline_level'] + effects['total_driver_effect']
+    effects = pd.DataFrame(index=y_base.index)
+    effects['adjusted_level'] = y_base + inc_df['driver_increment']
+    effects = effects.loc[fut_years]
 
     base_z = (y_base - mu[key]) / sd[key]
-    adj_z = base_z + total_adj
+    adj_z = base_z + sum(
+        get_driver_z_series(d, int(l), y_base.index, targets) * ols.params[d]
+        for d,l in [t.split('_L') for t in terms]
+    )
     band_z = (band / 1.96) / sd[key]
     band_z.loc[y_hist.index] = 0
 
     N = 5000
-    noise_ets = np.random.normal(0, band_z.values[None, :], size=(N, len(adj_z)))
-    boot = np.random.choice(ols.resid, size=(N, len(adj_z) - len(y_hist)), replace=True)
-    noise_res = np.zeros((N, len(adj_z)))
+    tot = len(adj_z)
+    noise_ets = np.random.normal(0, band_z.values[None, :], (N, tot))
+    boot = np.random.choice(ols.resid, size=(N, tot - len(y_hist)), replace=True)
+    noise_res = np.zeros((N, tot))
     noise_res[:, len(y_hist):] = boot
+    sims_full = (adj_z.values + noise_ets + noise_res) * sd[key] + mu[key]
+    sims = sims_full[:, len(y_hist):]
 
-    sims_z = adj_z.values + noise_ets + noise_res
-    sims = sims_z * sd[key] + mu[key]
-
-    thr = THRESHOLD[key]
     win = EVENT_WINDOW[key]
+    thr = THRESHOLD[key]
     if '-' in win:
-        y0, y1 = map(int, win.split('-'))
-        mask = (adj_z.index >= y0) & (adj_z.index <= y1)
+        start, end = map(int, win.split('-'))
+        mask = [(y >= start and y <= end) for y in fut_years]
         metric = sims[:, mask].mean(axis=1)
     else:
-        metric = sims[:, list(adj_z.index).index(int(win))]
+        idx = fut_years.index(int(win))
+        metric = sims[:, idx]
     prob = (metric > thr).mean()
 
     return prob, sims, effects
